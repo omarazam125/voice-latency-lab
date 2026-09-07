@@ -1,0 +1,28 @@
+{
+  "name": "@vll/server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "tsx watch --clear-screen=false src/index.ts",
+    "start": "tsx src/index.ts",
+    "bench": "tsx src/cli/bench.ts",
+    "kb:index": "tsx src/cli/kbIndex.ts",
+    "doctor": "tsx src/cli/doctor.ts",
+    "trace": "tsx src/cli/trace.ts"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.0.2",
+    "@fastify/multipart": "^9.0.3",
+    "@fastify/websocket": "^11.0.2",
+    "@vll/audio": "*",
+    "@vll/core": "*",
+    "@vll/providers": "*",
+    "@vll/rag": "*",
+    "@vll/telemetry": "*",
+    "dotenv": "^16.4.7",
+    "fastify": "^5.2.1",
+    "ws": "^8.18.0"
+  }
+}

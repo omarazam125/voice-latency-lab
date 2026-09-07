@@ -1,0 +1,37 @@
+{
+  "name": "voice-latency-lab",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Production-quality local benchmarking application for diagnosing latency in an AI call-center voice pipeline.",
+  "type": "module",
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,web -c cyan,magenta \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "npm run dev --workspace @vll/server",
+    "dev:web": "npm run dev --workspace @vll/web",
+    "build": "npm run build --workspace @vll/web",
+    "start": "concurrently -n server,web -c cyan,magenta \"npm:start:server\" \"npm:start:web\"",
+    "start:server": "npm run start --workspace @vll/server",
+    "start:web": "npm run start --workspace @vll/web",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:ui": "vitest --ui",
+    "typecheck": "tsc -b --pretty",
+    "bench": "npm run bench --workspace @vll/server",
+    "kb:index": "npm run kb:index --workspace @vll/server",
+    "doctor": "npm run doctor --workspace @vll/server"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "concurrently": "^9.1.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

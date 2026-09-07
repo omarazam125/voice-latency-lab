@@ -1,0 +1,20 @@
+node_modules/
+dist/
+.next/
+out/
+*.tsbuildinfo
+.env
+.env.local
+.env.*.local
+data/kb-index/
+data/uploads/
+data/sessions/
+data/exports/
+# Call recordings hold verbatim caller transcripts and model output.
+data/calls/
+# Saved operator settings, which include the production system prompt.
+data/session-config.json
+coverage/
+.DS_Store
+Thumbs.db
+*.log

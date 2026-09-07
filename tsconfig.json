@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": ["packages/*/src/**/*.ts", "apps/server/src/**/*.ts", "vitest.config.ts"],
+  "exclude": ["node_modules", "**/dist", "**/.next", "apps/web/**"]
+}

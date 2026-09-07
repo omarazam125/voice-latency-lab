@@ -1,0 +1,37 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
+    "allowJs": false,
+    "strict": true,
+    "noUncheckedIndexedAccess": false,
+    "exactOptionalPropertyTypes": false,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": false,
+    "useDefineForClassFields": true,
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@vll/telemetry": ["packages/telemetry/src/index.ts"],
+      "@vll/telemetry/*": ["packages/telemetry/src/*"],
+      "@vll/core": ["packages/core/src/index.ts"],
+      "@vll/core/*": ["packages/core/src/*"],
+      "@vll/providers": ["packages/providers/src/index.ts"],
+      "@vll/providers/*": ["packages/providers/src/*"],
+      "@vll/rag": ["packages/rag/src/index.ts"],
+      "@vll/rag/*": ["packages/rag/src/*"],
+      "@vll/audio": ["packages/audio/src/index.ts"],
+      "@vll/audio/*": ["packages/audio/src/*"]
+    }
+  },
+  "exclude": ["node_modules", "dist", ".next"]
+}

@@ -1,0 +1,579 @@
+================================================================================
+ ROADMAP — WHERE THE STREAMING HAPPENS
+================================================================================
+
+ A map of this codebase for one purpose: to show exactly where the STT -> LLM
+ -> TTS workflow is streamed, for Mode B and for Mode C.
+
+ Every reference is FILE:LINE. Line numbers drift as code changes; the function
+ name next to each one is the reliable anchor.
+
+ There are two pipeline modes. They share every provider, the prompt, the voice
+ and the knowledge base, and differ ONLY in orchestration:
+
+   MODE B   Streaming pipeline.
+            Acts on a stabilised partial transcript, prefetches retrieval, and
+            hands short speakable phrases to the voice engine as soon as they
+            exist.
+
+   MODE C   Vapi-style orchestration.
+            Everything Mode B does, plus content-aware endpointing, a voice
+            chunk planner with flush support, conditional retrieval, and an
+            interruption classifier that separates backchannels from genuine
+            interruptions.
+
+
+================================================================================
+ 1. THE SHAPE OF A TURN
+================================================================================
+
+ Both modes run the same five stages. The difference is how much of each stage
+ overlaps the next.
+
+   caller speaks
+        |
+        v
+   [1] VAD detects the end of the turn          (browser)
+        |
+        v
+   [2] STT resolves WHICH transcript to use     <-- Mode B and C differ here
+        |
+        v
+   [3] RETRIEVAL fetches context                <-- Mode B and C differ here
+        |
+        v
+   [4] LLM streams text deltas
+        |
+        v
+   [5] CHUNKER cuts deltas into speakable       <-- Mode B and C differ here
+       phrases and dispatches each to TTS
+        |
+        v
+   audio plays while the model is still writing
+
+
+ The important property: stage 5 begins before stage 4 finishes, and stage 4
+ begins before the model has produced a full sentence. Nothing waits for the
+ stage before it to complete.
+
+
+================================================================================
+ 2. MODE B — STREAMING PIPELINE
+================================================================================
+
+ Everything for Mode B lives in one file:
+
+   packages/core/src/pipeline/turnRunner.ts        (644 lines)
+
+ --------------------------------------------------------------------------
+ 2.1  Turn entry point
+ --------------------------------------------------------------------------
+
+   turnRunner.ts:131   class TurnRunner
+   turnRunner.ts:167   async run()          <-- the whole turn, top to bottom
+
+  run() calls the three stages in order:
+
+   turnRunner.ts:175     await this.resolveTranscript()
+   turnRunner.ts:196     await this.runRetrieval(...)
+   turnRunner.ts:200     await this.generateAndSpeak(...)
+
+ --------------------------------------------------------------------------
+ 2.2  STT — which transcript the turn proceeds with
+ --------------------------------------------------------------------------
+
+   turnRunner.ts:252   private async resolveTranscript()
+
+  This is the first place latency is won or lost.
+
+  Speechmatics documents a hard floor of 0.7 s on its FINAL transcript. Waiting
+  for the final therefore puts a ~700 ms floor under the whole turn. Mode B does
+  not wait: if a partial transcript stopped changing before the caller stopped
+  speaking, that partial IS the utterance.
+
+  Order of preference inside resolveTranscript():
+
+    1. a final that has ALREADY arrived      -> use it, it is free
+    2. a partial stable for `partialStabilityMs` -> use it, marked provisional
+    3. the latest partial                    -> last resort
+
+  Honesty check — when the real final lands later, the turn records whether it
+  disagreed with what was actually used:
+
+   turnRunner.ts:308   private watchForLateFinal()
+
+  If it diverged, the telemetry event `stt.final` carries `diverged: true`. The
+  accuracy cost of the speed is measured, not assumed.
+
+  Where the transcripts come from:
+
+   apps/server/src/session.ts:495    onSttPartial()   <- every partial
+   apps/server/src/session.ts:528    onSttFinal()     <- every final
+   packages/providers/src/speechmatics/rtStt.ts:227  cb.onPartial(...)
+   packages/providers/src/speechmatics/rtStt.ts:231  cb.onFinal(...)
+
+ --------------------------------------------------------------------------
+ 2.3  RETRIEVAL — started before the turn does
+ --------------------------------------------------------------------------
+
+   turnRunner.ts:327   private async runRetrieval()
+
+  Retrieval is speculative. While the caller is still talking, a stabilised
+  partial is used to start a knowledge-base search, so by the time the turn
+  actually begins the context is often already in hand:
+
+   apps/server/src/session.ts:557   private maybePrefetch()
+
+  If the final query is close enough to the prefetched one
+  (`prefetchReuseThreshold`), the prefetched result is reused and retrieval
+  contributes 0 ms to the turn.
+
+ --------------------------------------------------------------------------
+ 2.4  LLM — acted on from the first token
+ --------------------------------------------------------------------------
+
+   turnRunner.ts:397   private async generateAndSpeak()
+
+  The model request is a streaming SSE call. Text arrives as deltas:
+
+   packages/providers/src/openai/responsesLlm.ts:189  res.body.getReader()
+   packages/providers/src/openai/responsesLlm.ts:211  case 'response.output_text.delta'
+   packages/providers/src/openai/responsesLlm.ts:220  cb.onDelta(d)
+
+  And each delta is pushed straight into the chunker:
+
+   turnRunner.ts:523     onFirstDelta   <-- TELEMETRY ONLY
+   turnRunner.ts:532     onDelta        <-- the real path
+   turnRunner.ts:534       chunker.push(d)
+   turnRunner.ts:568     chunker.finish()
+
+  NOTE, because it is an easy mistake to make: `onDelta` fires for the FIRST
+  delta as well. `onFirstDelta` exists purely to timestamp it. Pushing in both
+  callbacks would duplicate the first token of every answer.
+
+ --------------------------------------------------------------------------
+ 2.5  CHUNKER — the decision that makes streaming audible
+ --------------------------------------------------------------------------
+
+   packages/core/src/text/chunker.ts   (474 lines)
+   chunker.ts:167   class StreamingSpeechChunker
+
+  This is the highest-leverage component in the pipeline. Everything upstream
+  is bounded by what the providers do; this part is entirely ours.
+
+  The question it answers: given a partially generated response, is there
+  enough text to speak yet?
+
+   chunker.ts:209   push(delta)         <- text arrives
+   chunker.ts:247   private evaluate()  <- is there a speakable phrase?
+   chunker.ts:257   private tryFlushOnce()
+   chunker.ts:371   private flushAt()   <- emit a phrase
+   chunker.ts:221   finish()            <- stream ended, flush the remainder
+
+  The policy is data, not code:
+
+   chunker.ts:75    STREAMING_POLICY
+
+     first phrase:       3 words / 20 chars minimum, 140 ms grace,
+                         word boundaries allowed, earliest cut preferred
+     later phrases:      8 words / 50 chars minimum, 180 ms grace,
+                         strongest boundary preferred
+
+  The first phrase is deliberately more aggressive than the rest: it is the only
+  one the caller is waiting on. Later phrases can afford to be shaped for
+  prosody because audio is already playing.
+
+  Boundary safety — a phrase must never be cut inside something that would be
+  mispronounced:
+
+   packages/core/src/text/boundaries.ts   protects numbers, URLs, emails,
+                                          dates and abbreviations
+
+  Markup removal, so the caller never hears syntax:
+
+   chunker.ts:447   stripMarkdown()
+
+  Order matters here and is enforced by a test: markup is stripped while the
+  newlines are still present, THEN whitespace is collapsed. Collapsing first
+  disables every line-anchored rule and the bullets get spoken.
+
+ --------------------------------------------------------------------------
+ 2.6  TTS — phrases dispatched and released in order
+ --------------------------------------------------------------------------
+
+   packages/core/src/pipeline/ttsScheduler.ts   (326 lines)
+   ttsScheduler.ts:119   enqueue(phrase)
+   ttsScheduler.ts:158   private pump()            <- start requests
+   ttsScheduler.ts:181   private dispatch()        <- one synthesis request
+   ttsScheduler.ts:248   private route()           <- audio -> output
+   ttsScheduler.ts:262   private advanceRelease()  <- ORDERING GUARANTEE
+
+  Phrases may be SYNTHESISED concurrently but must be RELEASED strictly in
+  order, or the caller hears sentence two before sentence one.
+  `advanceRelease()` is what enforces that.
+
+  Concurrency depends on the transport:
+
+   packages/providers/src/hamsa/transports.ts
+
+     websocket   ONE request at a time. The realtime socket carries no
+                 correlation id, so two in-flight requests cannot be told
+                 apart. Every phrase therefore waits for the previous one and
+                 pays time-to-first-audio again — heard as word, pause, word.
+
+     http        Keep-alive POST per phrase. Requests OVERLAP, so phrase N+1
+                 is synthesised while phrase N is still playing, and the gaps
+                 close. Also gives real cancellation via AbortController,
+                 which the websocket cannot do.
+
+  The default is http, for both reasons.
+
+  Handoff to the browser:
+
+   turnRunner.ts:589   private emitAudio()
+
+
+================================================================================
+ 3. MODE C — VAPI-STYLE ORCHESTRATION
+================================================================================
+
+ Mode C is a separate orchestrator. It does not extend Mode B; it is its own
+ file, so Mode B stays untouched and the comparison between them stays valid.
+
+   packages/core/src/modeC/orchestrator.ts   (966 lines)
+
+ --------------------------------------------------------------------------
+ 3.1  Turn entry point
+ --------------------------------------------------------------------------
+
+   orchestrator.ts:229   class ModeCOrchestrator
+   orchestrator.ts:287   async run()
+
+  Same three stages, same order:
+
+   orchestrator.ts:301     await this.resolveTranscript()
+   orchestrator.ts:319     await this.runRetrieval(...)
+   orchestrator.ts:323     await this.generateAndSpeak(...)
+
+ --------------------------------------------------------------------------
+ 3.2  ENDPOINTING — the stage Mode B does not have
+ --------------------------------------------------------------------------
+
+ This runs BEFORE the turn starts, and decides WHEN the turn starts at all.
+
+   packages/core/src/modeC/endpointing.ts
+   endpointing.ts   EndpointingManager.evaluate()
+   endpointing.ts   classifyTranscript()
+   endpointing.ts   computeStability()
+   endpointing.ts   classifyInterruption()
+
+  Mode B commits after a fixed silence threshold. Mode C picks the required
+  silence from WHAT THE CALLER ACTUALLY SAID:
+
+    ends in punctuation     -> commit fast, the thought is finished
+    ends in a number        -> wait longer, more digits may follow
+    ends mid-clause         -> wait longest
+    transcript still moving -> distrust the punctuation and wait anyway
+
+  A floor always applies, so punctuation can never commit sooner than the
+  configured minimum.
+
+  Live wiring:
+
+   apps/server/src/session.ts:817   private onModeCCommit()
+
+ --------------------------------------------------------------------------
+ 3.3  INTERRUPTION HANDLING — two-stage barge-in
+ --------------------------------------------------------------------------
+
+   apps/server/src/session.ts:716   onBargeIn()
+   apps/server/src/session.ts:754   private resolveBargeIn()
+
+  A barge-in is detected from roughly 80 ms of acoustic energy — long before
+  any word has been transcribed. So the browser cannot know whether the caller
+  is interrupting or just saying "mm".
+
+  Mode C with a stopSpeaking plan therefore does this:
+
+    STAGE 1 (immediate)   DUCK the audio. The caller hears instantly that they
+                          were noticed, but the queue is KEPT, because
+                          discarded audio cannot be recovered.
+
+    STAGE 2 (on the first partial transcript)
+                          Classify. A genuine interruption cancels the turn; a
+                          lone acknowledgement resumes it mid-word.
+
+  Configured phrase lists decide the outcome:
+
+   packages/core/src/modeC/config.ts   stopSpeaking.acknowledgementPhrases
+                                       stopSpeaking.interruptionPhrases
+                                       stopSpeaking.numWords
+                                       stopSpeaking.voiceSeconds
+                                       stopSpeaking.backoffSeconds
+
+  Browser side:
+
+   apps/web/lib/store.ts    case 'barge_in'          <- duck, do not flush
+   apps/web/lib/store.ts    case 'bargein.resolved'  <- flush, or resume
+   apps/web/lib/player.ts   duck()                   <- lower gain, keep queue
+
+  A safety net covers a verdict that never arrives: after ~1.1 s the browser
+  treats it as a real interruption. Talking over a caller who wants the turn is
+  a worse failure than cutting off one who did not.
+
+ --------------------------------------------------------------------------
+ 3.4  STT and RETRIEVAL
+ --------------------------------------------------------------------------
+
+   orchestrator.ts:387   private async resolveTranscript()
+   orchestrator.ts:422   private async runRetrieval()
+
+  Retrieval is CONDITIONAL in Mode C. Not every utterance needs the knowledge
+  base — "thanks" does not — and a skipped search costs nothing:
+
+   orchestrator.ts:194   shouldRetrieve(text, cfg)
+
+  Relevance gating lives in the retriever itself:
+
+   packages/rag/src/bm25.ts     coverage  <- share of the question's IDF mass
+                                            that a passage actually matched
+   packages/rag/src/store.ts    the coverage floor is applied here
+
+  This matters more than it looks. The BM25 `score` is normalised against the
+  best hit, so the top result is ALWAYS 1.0 — a floor on it can never reject
+  anything. `coverage` is absolute, and it is what stops an off-topic question
+  retrieving three confident-looking but unrelated passages.
+
+ --------------------------------------------------------------------------
+ 3.5  LLM
+ --------------------------------------------------------------------------
+
+   orchestrator.ts:524   private async generateAndSpeak()
+   orchestrator.ts:743     onFirstDelta   <-- telemetry only, as in Mode B
+   orchestrator.ts:748     onDelta
+   orchestrator.ts:750       planner.push(d)
+   orchestrator.ts:780     planner.finish()
+
+  Token accounting, used by the context-size investigation:
+
+   orchestrator.ts:132   estimateTokens()          (Arabic ~2 chars/token)
+   orchestrator.ts:144   buildContextAccounting()
+
+ --------------------------------------------------------------------------
+ 3.6  VOICE CHUNK PLANNER — Mode C's chunker
+ --------------------------------------------------------------------------
+
+   packages/core/src/modeC/voiceChunkPlanner.ts   (567 lines)
+   voiceChunkPlanner.ts:116   class VoiceChunkPlanner
+
+   voiceChunkPlanner.ts:156   push(delta)
+   voiceChunkPlanner.ts:225   private evaluate()
+   voiceChunkPlanner.ts:232   private tryEmit()
+   voiceChunkPlanner.ts:334   private usableBoundaries()
+   voiceChunkPlanner.ts:350   private emit()
+   voiceChunkPlanner.ts:198   finish()
+
+  What it adds over Mode B's chunker:
+
+  a) ADAPTIVE FIRST CHUNK — the first chunk is sized separately from the rest,
+     because it is the only one affecting time-to-first-speech.
+
+  b) FLUSH MARKER — the model can force an immediate cut by emitting a marker,
+     in any of three documented spellings:
+
+       voiceChunkPlanner.ts:429   indexOfMarker()
+       voiceChunkPlanner.ts:442   stripAllMarkers()
+       voiceChunkPlanner.ts:454   trailingPartialMarker()
+
+     The marker is ALWAYS stripped before synthesis, including when flush
+     handling is switched off. A marker carries no meaning then, but it is
+     still not something a caller should hear.
+
+     `trailingPartialMarker()` handles a marker split across two deltas, so a
+     half-arrived marker is held back rather than spoken.
+
+  c) NATURAL CUT PREFERENCE — a chunk must not end on a word that leaves the
+     phrase dangling:
+
+       voiceChunkPlanner.ts:536   endsOnFunctionWord()
+       voiceChunkPlanner.ts:550   preferNaturalCut()
+       voiceChunkPlanner.ts:525   hasOpenQuote()
+
+     The function-word list includes Gulf and Saudi interrogatives, because the
+     production prompt mandates that dialect and those are the words the model
+     actually produces. A chunk ending on one splits the question in half.
+
+ --------------------------------------------------------------------------
+ 3.7  TTS
+ --------------------------------------------------------------------------
+
+  Mode C uses the same scheduler as Mode B, plus a phrase cache:
+
+   orchestrator.ts:790   private dispatchChunk()
+   orchestrator.ts:853   private cacheKeyFor()      <- ONE key builder
+   orchestrator.ts:874   private storePhraseInCache()
+   orchestrator.ts:895   private emitAudio()
+
+   packages/core/src/modeC/ttsCache.ts   the cache itself
+
+  Two deliberate details:
+
+    - One key builder is used for both the store and the lookup. Two
+      hand-rolled key literals would drift, and a cache that never hits looks
+      exactly like a cache that is never written.
+
+    - A cancelled turn is never cached. A barge-in truncates audio mid-word,
+      and caching that would make every later hit play a clipped phrase for the
+      life of the process.
+
+
+================================================================================
+ 4. THE BROWSER SIDE
+================================================================================
+
+ Capture (microphone -> server):
+
+   apps/web/lib/capture.ts    AudioWorklet capture, 48 kHz -> 16 kHz with
+                              anti-aliased decimation. Not MediaRecorder:
+                              MediaRecorder buffers, which is fatal here.
+   apps/web/lib/silero.ts     Silero VAD v5 via onnxruntime-web
+   apps/web/lib/vadTypes.ts   TurnDetector — speech start/end, barge-in
+
+ Playback (server -> speaker):
+
+   apps/web/lib/player.ts                   StreamingPlayer
+   apps/web/public/worklets/player-processor.js   ring buffer
+
+  The ring buffer's overflow policy is worth knowing about. When the queue is
+  full it drops the NEWEST audio, never the oldest. Dropping the oldest deletes
+  the samples currently being spoken, which puts a hole in the middle of a word
+  and destroys intelligibility; losing the tail of an over-long answer merely
+  shortens it.
+
+ Clocks:
+
+   apps/web/lib/clock.ts               browser <-> server clock sync
+   packages/telemetry/src/clock.ts     monotonic clock, Cristian's algorithm
+
+  All durations use monotonic clocks. `Date.now()` is never used for a
+  measurement — it can jump backwards.
+
+
+================================================================================
+ 5. MEASUREMENT
+================================================================================
+
+   packages/telemetry/src/events.ts       typed event model
+   packages/telemetry/src/bus.ts          ring buffer; emit() does one clock
+                                          read and O(1) array writes — no JSON,
+                                          no I/O, no await on the hot path
+   packages/telemetry/src/derive.ts       per-turn metrics, critical path
+   packages/telemetry/src/attribution.ts  provider time vs our time
+
+ The critical path is a NON-OVERLAPPING chain that sums exactly to the
+ end-to-end latency. Waterfall spans may overlap; the critical path may not.
+ A stage that was prefetched contributes 0 ms and is marked hidden.
+
+ Call recording — every call is written to disk for later diagnosis:
+
+   apps/server/src/callRecorder.ts
+
+     data/calls/<sessionId>.txt      turn-by-turn narrative, for reading
+     data/calls/<sessionId>.ndjson   every event, for analysis
+
+ The narrative lines up four things per turn, which is what makes a bad answer
+ diagnosable at all:
+
+     heard (FINAL)  ->  what the transcriber produced
+     ACTED ON       ->  which transcript the pipeline actually used
+     MODEL WROTE    ->  what the model generated
+     SPOKEN         ->  the exact string handed to the voice engine
+
+ A mismatch between any two of those points at a different cause:
+
+     heard  != ACTED ON      the turn committed too early
+     ACTED ON is wrong       the transcriber misheard
+     MODEL WROTE != SPOKEN   the chunker or markup stripping is at fault
+     all four agree          the model itself gave a bad answer
+
+
+================================================================================
+ 6. FILE MAP
+================================================================================
+
+ packages/core/src/
+   config.ts                    session config, defaults, clamping
+   providers.ts                 provider interfaces
+   protocol.ts                  browser <-> server message types
+   text/chunker.ts              Mode B chunker
+   text/boundaries.ts           boundary detection and token protection
+   pipeline/turnRunner.ts       MODE B ORCHESTRATION
+   pipeline/ttsScheduler.ts     phrase queue, ordering, backpressure
+   modeC/orchestrator.ts        MODE C ORCHESTRATION
+   modeC/endpointing.ts         endpointing + interruption classification
+   modeC/voiceChunkPlanner.ts   Mode C chunker
+   modeC/ttsCache.ts            phrase cache
+   modeC/config.ts              Mode C settings
+
+ packages/providers/src/
+   speechmatics/rtStt.ts        realtime STT
+   openai/responsesLlm.ts       streaming LLM
+   openai/sse.ts                SSE parser
+   hamsa/transports.ts          TTS transports (websocket and http)
+
+ packages/telemetry/src/        clocks, events, bus, derived metrics
+ packages/rag/src/              BM25 retrieval, chunking, Arabic normalisation
+ packages/audio/src/            PCM helpers, WAV, VAD types
+
+ apps/server/src/
+   index.ts                     HTTP + WebSocket server
+   session.ts                   ONE CALL: warm-up, turns, barge-in, recording
+   modeCRuntime.ts              session-scoped Mode C state
+   callRecorder.ts              writes each call to disk
+   configStore.ts               config persistence
+   replay.ts                    replay a fixed clip through each mode
+   benchmarks.ts                isolated per-stage benchmarks
+   llmLab.ts                    model and context probes
+   fillerAudio.ts               pre-rendered hesitation sounds
+   routes/                      HTTP endpoints
+
+ apps/web/
+   lib/capture.ts               microphone capture
+   lib/player.ts                streaming playback
+   lib/ambience.ts              background audio (Mode C)
+   lib/store.ts                 client state, WebSocket handling
+   app/monitor/                 live per-turn view
+   app/turns/                   waterfall and breakdown
+   app/compare/                 replay one clip through both modes
+   app/vapi-lab/                Mode C controls
+   app/dashboard/               percentiles across turns
+   app/settings/                every tunable
+
+
+================================================================================
+ 7. RUNNING IT
+================================================================================
+
+   npm install
+
+   Create a .env in the repo root:
+
+     OPENAI_API_KEY=...
+     SPEECHMATICS_API_KEY=...
+     SPEECHMATICS_REGION=eu
+     HAMSA_API_KEY=...
+     HAMSA_SPEAKER_ID=...
+     HOST=127.0.0.1
+     PORT=8787
+     WEB_ORIGIN=http://localhost:3000
+     NEXT_PUBLIC_SERVER_URL=http://127.0.0.1:8787
+
+   Server:     cd apps/server && npm run dev
+   Web:        cd apps/web    && npm run dev
+   Tests:      npx vitest run
+   Typecheck:  npx tsc --noEmit -p tsconfig.json
+
+   Trace a live call:   cd apps/server && npm run trace
+   Check provider setup: cd apps/server && npm run doctor
+
+================================================================================
