@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { ClockSynchronizer, deltaMs, msToNs, nsToMs, nowNs, roundMs } from './clock.js';
 import { TelemetryBus, ScopedEmitter } from './bus.js';
+import type { PipelineMode } from './events.js';
 import { deriveTurnMetrics, CRITICAL_PATH_KEYS, gradeSegment, gradeTtfs } from './derive.js';
 import { improvementPct, percentile, summarize, summarizeBy } from './stats.js';
 import type { EventName, TelemetryEvent } from './events.js';
@@ -223,7 +224,7 @@ describe('telemetry bus', () => {
 const NS = (ms: number) => BigInt(Math.round(ms * 1e6));
 
 /** Build a synthetic turn from (event, msAfterSpeechEnd) pairs. */
-function buildTurn(pairs: Array<[EventName, number, Record<string, unknown>?]>, mode: 'A' | 'B' = 'B'): TelemetryEvent[] {
+function buildTurn(pairs: Array<[EventName, number, Record<string, unknown>?]>, mode: PipelineMode = 'B'): TelemetryEvent[] {
   const base = 1_000_000_000_000n;
   let seq = 0;
   return pairs.map(([event, at, metadata]) => ({
@@ -307,7 +308,7 @@ describe('turn metric derivation', () => {
         ['audio.browser_first_received', 4330],
         ['audio.playback_started', 4380],
       ],
-      'A',
+      'B',
     );
     const m = deriveTurnMetrics(buffered)!;
     expect(m.bottleneck).toBe('llm_buffer');

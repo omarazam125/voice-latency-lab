@@ -29,10 +29,9 @@ export const STAGES = [
 
 export type Stage = (typeof STAGES)[number];
 
-export type PipelineMode = 'A' | 'B' | 'C';
+export type PipelineMode = 'B' | 'C';
 
 export const PIPELINE_MODE_LABELS: Record<PipelineMode, string> = {
-  A: 'Baseline · Sentence-Buffered',
   B: 'Ultra Low Latency · Streaming',
   C: 'Vapi-Style · Orchestrated',
 };
